@@ -3,6 +3,7 @@
 # See "LICENSE" for further details.
 
 # ....................{ IMPORTS                            }....................
+import torch
 import numpy as np
 import numpy.ma as ma
 from scipy import interpolate as interp
@@ -15,58 +16,66 @@ from betse.science.math import finitediff as fd
 # Toolbox of functions used in the Simulator class to calculate key bioelectric
 # properties.
 
-def electroflux(cA,cB,Dc,d,zc,vBA,T,p,rho=1):
+def electroflux(cA, cB, Dc, d, zc, vBA, T, p, rho=1):
     """
-    Electro-diffusion between two connected volumes. Note for cell work, 'b' is
-    'inside', 'a' is outside, with a positive flux moving from a to b. The
-    voltage is defined as Vb - Va (Vba), which is equivalent to Vmem.
-
-    This function defaults to regular diffusion if Vba == 0.0.
-
-    This function takes numpy matrix values as input. All inputs must be
-    matrices of the same shape.
-
-    This is the Goldman Flux/Current Equation (not to be confused with the
-    Goldman Equation). Note: the Nernst-Planck equation has been trialed in
-    place of this, and it does not reproduce proper reversal potentials.
-
-    Parameters
-    ----------
-    cA          concentration in region A [mol/m3] (out)
-    cB          concentration in region B [mol/m3] (in)
-    Dc          Diffusion constant of c  [m2/s]
-    d           Distance between region A and region B [m]
-    zc          valence of ionic species c
-    vBA         voltage difference between region B (in) and A (out) = Vmem
-    p           an instance of the Parameters class
-
-    Returns
-    --------
-    flux        Chemical flux magnitude between region A and B [mol/s]
-
+    Sovereign-Accelerated Electro-Diffusion (Metal/MPS Backend).
+    Calculates the Goldman-Hodgkin-Katz flux using GPU exponentials.
     """
-
-    # Reasonably small real number, preventing divide by zero errors.
-    # Note that "betse.util.type.numeric.floats.FLOAT_MIN", the
-    # smallest possible real number, is too small for this use case.
+    # 1. CONSTANTS
     FLOAT_NONCE = 1.0e-25
+    
+    # 2. SOVEREIGN BRIDGE (Move Data to GPU)
+    # Check if inputs are already Tensors (future-proofing) or Numpy
+    if isinstance(cA, np.ndarray):
+        device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+        
+        # Detach and cast to float32 (MPS prefers 32-bit for speed)
+        cA_t = torch.tensor(cA, device=device, dtype=torch.float32)
+        cB_t = torch.tensor(cB, device=device, dtype=torch.float32)
+        vBA_t = torch.tensor(vBA, device=device, dtype=torch.float32)
+        Dc_t = torch.tensor(Dc, device=device, dtype=torch.float32)
+        d_t = torch.tensor(d, device=device, dtype=torch.float32)
+        
+        # Handle scalar vs array for 'zc' and 'rho'
+        if isinstance(zc, np.ndarray):
+            zc_t = torch.tensor(zc, device=device, dtype=torch.float32)
+        else:
+            zc_t = zc # Scalar allows broadcasting
+            
+        if isinstance(rho, np.ndarray):
+            rho_t = torch.tensor(rho, device=device, dtype=torch.float32)
+        else:
+            rho_t = rho
+            
+        return_numpy = True
+    else:
+        # Already tensors (fully optimized pipeline)
+        cA_t, cB_t, vBA_t, Dc_t, d_t, zc_t, rho_t = cA, cB, vBA, Dc, d, zc, rho
+        device = cA.device
+        return_numpy = False
 
-    vBA += FLOAT_NONCE
+    # 3. THE PHYSICS (GPU Optimized)
+    # Prevent divide by zero (Non-mutating addition for safety)
+    vBA_safe = vBA_t + FLOAT_NONCE
+    zc_safe = zc_t + FLOAT_NONCE
 
-    zc += FLOAT_NONCE
+    # Calculate Alpha (Dimensionless Potential)
+    # F and R are scalars from 'p', safe to use directly
+    alpha = (zc_safe * vBA_safe * p.F) / (p.R * T)
 
-    alpha = (zc*vBA*p.F)/(p.R*T)
+    # The Heavy Lift: Exponentials on Metal SFUs
+    exp_alpha = torch.exp(-alpha)
+    deno = -torch.expm1(-alpha)  # precise exp(x)-1 calculation
 
-    exp_alpha = np.exp(-alpha)
+    # Calculate Flux
+    # flux = -((Dc * alpha) / d) * ((cB - cA * exp_alpha) / deno) * rho
+    flux = -((Dc_t * alpha) / d_t) * ((cB_t - cA_t * exp_alpha) / deno) * rho_t
 
-    deno = -np.expm1(-alpha)   # calculate the denominator for the electrodiffusion equation,..
-
-    # calculate the flux for those elements:
-    flux = -((Dc*alpha)/d)*((cB -cA*exp_alpha)/deno)*rho
-
-    # flux = flux*rho
-
-    return flux
+    # 4. RETURN
+    if return_numpy:
+        return flux.cpu().numpy()
+    else:
+        return flux
 
 def pumpNaKATP(cNai,cNao,cKi,cKo,Vm,T,p,block, met = None):
 

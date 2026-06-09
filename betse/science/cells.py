@@ -5,6 +5,7 @@
 
 # ....................{ IMPORTS                           }....................
 import math
+import torch
 import numpy as np
 from numpy import ndarray
 from scipy import interpolate as interp
@@ -2420,30 +2421,58 @@ class Cells(object):
 
     def integrator(self, f, fmem) -> tuple:
         """
-        Finite volume integrator for the irregular Voronoi cell grid.
-
-        Interpolates a parameter defined on cell centres to membrane midpoints
-        and then uses a centre-midpoint interpolation scheme to calculate the
-        working 2D integral (volume independent).
-
-        Parameters
-        -----------
-        f                  A parameter defined on cell centres
-        fmem               Same parameter defined on cell membranes
-
-        Returns
-        -----------
-        fcent          Finite volume interpolation integral over each cell grid (volume independent)
-        fmemi          Interpolation of parameter between adjacent membranes
+        Sovereign-Accelerated Integrator (Metal/MPS Backend).
+        Replaces CPU Dot Product with GPU Sparse Multiplication.
         """
+        # --- 1. SOVEREIGN CACHING (The First Run) ---
+        # We convert the connectivity matrix to a GPU Tensor once and keep it there.
+        if not hasattr(self, '_M_sum_mems_mps'):
+            print("⚡ KSL: Initializing Sovereign Matrix Cache on M3 Ultra...")
+            device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+            
+            # Convert the sparse matrix to a Dense Tensor (or Sparse COO if supported)
+            # Note: For smaller grids, Dense is often faster on MPS due to driver maturity.
+            # We assume M_sum_mems is a 2D Numpy array.
+            self._M_sum_mems_mps = torch.tensor(self.M_sum_mems, device=device, dtype=torch.float32)
+            self._num_mems_mps = torch.tensor(self.num_mems, device=device, dtype=torch.float32)
+            self._device = device
 
-        # average the parameter between adjacent membranes:
-        fmemi = (fmem[self.nn_i] + fmem[self.mem_i])/2
+        # --- 2. DATA TRANSFER (Bridge to the Sovereign) ---
+        # If inputs are Numpy, move them to GPU. 
+        # (Future optimization: Keep them on GPU permanently to avoid this step)
+        if isinstance(f, np.ndarray):
+            f_gpu = torch.tensor(f, device=self._device, dtype=torch.float32)
+            fmem_gpu = torch.tensor(fmem, device=self._device, dtype=torch.float32)
+        else:
+            f_gpu = f
+            fmem_gpu = fmem
 
-        # average the values at the cell centre point:
-        fcent = (1/2)*(f + (np.dot(self.M_sum_mems, fmemi)/self.num_mems))
+        # --- 3. THE PHYSICS KERNEL (GPU Speed) ---
+        # Average parameter between adjacent membranes
+        # Note: self.nn_i and self.mem_i need to be lists or tensors. 
+        # For now, we perform the index lookup on CPU then move, or trust PyTorch indexing.
+        
+        # Fast Indexing on GPU requires indices to be Tensors too.
+        # For safety in this hybrid stage, we compute fmemi logic on the passed type
+        # but we optimize the HEAVY DOT PRODUCT below.
+        
+        # fallback for indexing if not fully converted
+        fmemi = (fmem[self.nn_i] + fmem[self.mem_i]) / 2.0
+        
+        # Move fmemi to GPU for the heavy lift
+        fmemi_gpu = torch.tensor(fmemi, device=self._device, dtype=torch.float32)
 
-        return fcent, fmemi
+        # THE HEAVY LIFT: Matrix Multiplication on M3 Ultra
+        # np.dot(Matrix, Vector) -> torch.matmul(Matrix, Vector)
+        dot_product = torch.matmul(self._M_sum_mems_mps, fmemi_gpu)
+        
+        # Final Calculation
+        fcent_gpu = 0.5 * (f_gpu + (dot_product / self._num_mems_mps))
+
+        # --- 4. RETURN (Bridge back to Legacy) ---
+        # We return Numpy arrays so the rest of the un-patched code doesn't crash.
+        # Once we patch 'sim.py', we will remove this .cpu().numpy() cost.
+        return fcent_gpu.cpu().numpy(), fmemi
 
     def curl(self, Fx, Fy, phi_z) -> tuple:
         """

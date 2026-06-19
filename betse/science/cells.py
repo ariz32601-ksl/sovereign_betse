@@ -2419,59 +2419,50 @@ class Cells(object):
 
         return f_mem
 
-    def integrator(self, f, fmem) -> tuple:
+    # Note: sim_conf_compute added as optional KW arg for backward compatibility
+    def integrator(self, f, fmem, sim_conf_compute=None) -> tuple:
         """
-        Sovereign-Accelerated Integrator (Metal/MPS Backend).
-        Replaces CPU Dot Product with GPU Sparse Multiplication.
+        Finite volume integrator. 
+        Routes to MPS (GPU) if configured, otherwise falls back to Numpy (CPU).
         """
-        # --- 1. SOVEREIGN CACHING (The First Run) ---
-        # We convert the connectivity matrix to a GPU Tensor once and keep it there.
+        if sim_conf_compute and sim_conf_compute.use_gpu:
+            return self._integrator_mps(f, fmem)
+        return self._integrator_cpu(f, fmem)
+
+    def _integrator_cpu(self, f, fmem) -> tuple:
+        """
+        Legacy NumPy implementation.
+        Preserved exactly from original source to guarantee 100% backward compatibility.
+        """
+        # average the parameter between adjacent membranes:
+        fmemi = (fmem[self.nn_i] + fmem[self.mem_i])/2
+
+        # average the values at the cell centre point:
+        fcent = (1/2)*(f + (np.dot(self.M_sum_mems, fmemi)/self.num_mems))
+
+        return fcent, fmemi
+
+    def _integrator_mps(self, f, fmem) -> tuple:
+        """Sovereign-Accelerated MPS implementation for Apple Silicon."""
+        # 1. Sovereign Cache (Initialize once to avoid PCI-e overhead)
         if not hasattr(self, '_M_sum_mems_mps'):
-            print("⚡ KSL: Initializing Sovereign Matrix Cache on M3 Ultra...")
-            device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-            
-            # Convert the sparse matrix to a Dense Tensor (or Sparse COO if supported)
-            # Note: For smaller grids, Dense is often faster on MPS due to driver maturity.
-            # We assume M_sum_mems is a 2D Numpy array.
+            device = 'mps'
+            # Cache the geometry matrix on VRAM
             self._M_sum_mems_mps = torch.tensor(self.M_sum_mems, device=device, dtype=torch.float32)
             self._num_mems_mps = torch.tensor(self.num_mems, device=device, dtype=torch.float32)
             self._device = device
 
-        # --- 2. DATA TRANSFER (Bridge to the Sovereign) ---
-        # If inputs are Numpy, move them to GPU. 
-        # (Future optimization: Keep them on GPU permanently to avoid this step)
-        if isinstance(f, np.ndarray):
-            f_gpu = torch.tensor(f, device=self._device, dtype=torch.float32)
-            fmem_gpu = torch.tensor(fmem, device=self._device, dtype=torch.float32)
-        else:
-            f_gpu = f
-            fmem_gpu = fmem
-
-        # --- 3. THE PHYSICS KERNEL (GPU Speed) ---
-        # Average parameter between adjacent membranes
-        # Note: self.nn_i and self.mem_i need to be lists or tensors. 
-        # For now, we perform the index lookup on CPU then move, or trust PyTorch indexing.
+        # 2. Bridge
+        f_gpu = torch.as_tensor(f, device=self._device, dtype=torch.float32)
         
-        # Fast Indexing on GPU requires indices to be Tensors too.
-        # For safety in this hybrid stage, we compute fmemi logic on the passed type
-        # but we optimize the HEAVY DOT PRODUCT below.
-        
-        # fallback for indexing if not fully converted
+        # 3. Physics (Heavy Dot Product)
         fmemi = (fmem[self.nn_i] + fmem[self.mem_i]) / 2.0
-        
-        # Move fmemi to GPU for the heavy lift
-        fmemi_gpu = torch.tensor(fmemi, device=self._device, dtype=torch.float32)
+        fmemi_gpu = torch.as_tensor(fmemi, device=self._device, dtype=torch.float32)
 
-        # THE HEAVY LIFT: Matrix Multiplication on M3 Ultra
-        # np.dot(Matrix, Vector) -> torch.matmul(Matrix, Vector)
+        # The Speedup: Sparse-Dense Multiplication on GPU
         dot_product = torch.matmul(self._M_sum_mems_mps, fmemi_gpu)
-        
-        # Final Calculation
         fcent_gpu = 0.5 * (f_gpu + (dot_product / self._num_mems_mps))
 
-        # --- 4. RETURN (Bridge back to Legacy) ---
-        # We return Numpy arrays so the rest of the un-patched code doesn't crash.
-        # Once we patch 'sim.py', we will remove this .cpu().numpy() cost.
         return fcent_gpu.cpu().numpy(), fmemi
 
     def curl(self, Fx, Fy, phi_z) -> tuple:

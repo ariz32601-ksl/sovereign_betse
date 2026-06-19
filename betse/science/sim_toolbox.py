@@ -11,71 +11,87 @@ from scipy.ndimage import gaussian_filter
 # from betse.science.math import toolbox as tb
 from betse.exceptions import BetseSimUnstableException
 from betse.science.math import finitediff as fd
+# --- SOVEREIGN IMPORT GUARD ---
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # ....................{ UTILITIES                          }....................
 # Toolbox of functions used in the Simulator class to calculate key bioelectric
 # properties.
 
-def electroflux(cA, cB, Dc, d, zc, vBA, T, p, rho=1):
+def electroflux(cA, cB, Dc, d, zc, vBA, T, p, rho=1, sim_conf_compute=None):
     """
-    Sovereign-Accelerated Electro-Diffusion (Metal/MPS Backend).
-    Calculates the Goldman-Hodgkin-Katz flux using GPU exponentials.
-    """
-    # 1. CONSTANTS
-    FLOAT_NONCE = 1.0e-25
+    Calculates electro-diffusive flux via Goldman-Hodgkin-Katz equation.
     
-    # 2. SOVEREIGN BRIDGE (Move Data to GPU)
-    # Check if inputs are already Tensors (future-proofing) or Numpy
-    if isinstance(cA, np.ndarray):
-        device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-        
-        # Detach and cast to float32 (MPS prefers 32-bit for speed)
-        cA_t = torch.tensor(cA, device=device, dtype=torch.float32)
-        cB_t = torch.tensor(cB, device=device, dtype=torch.float32)
-        vBA_t = torch.tensor(vBA, device=device, dtype=torch.float32)
-        Dc_t = torch.tensor(Dc, device=device, dtype=torch.float32)
-        d_t = torch.tensor(d, device=device, dtype=torch.float32)
-        
-        # Handle scalar vs array for 'zc' and 'rho'
-        if isinstance(zc, np.ndarray):
-            zc_t = torch.tensor(zc, device=device, dtype=torch.float32)
-        else:
-            zc_t = zc # Scalar allows broadcasting
-            
-        if isinstance(rho, np.ndarray):
-            rho_t = torch.tensor(rho, device=device, dtype=torch.float32)
-        else:
-            rho_t = rho
-            
-        return_numpy = True
-    else:
-        # Already tensors (fully optimized pipeline)
-        cA_t, cB_t, vBA_t, Dc_t, d_t, zc_t, rho_t = cA, cB, vBA, Dc, d, zc, rho
-        device = cA.device
-        return_numpy = False
+    Sovereign Hybrid Dispatch:
+    - If hardware+config allows, routes to Metal Performance Shaders (GPU).
+    - Otherwise, falls back to legacy NumPy implementation (CPU).
+    """
+    # PATH A: SPEEDBOAT (GPU)
+    # Only triggers if config is explicitly passed AND gpu is enabled
+    if sim_conf_compute and sim_conf_compute.use_gpu:
+        return _electroflux_mps(cA, cB, Dc, d, zc, vBA, T, p, rho)
+    
+    # PATH B: HORSE (CPU)
+    # Default fallback for all existing calls
+    return _electroflux_cpu(cA, cB, Dc, d, zc, vBA, T, p, rho)
 
-    # 3. THE PHYSICS (GPU Optimized)
-    # Prevent divide by zero (Non-mutating addition for safety)
+
+def _electroflux_cpu(cA, cB, Dc, d, zc, vBA, T, p, rho):
+    """
+    Legacy NumPy implementation for x86/Linux/Windows.
+    Preserved exactly from original source to guarantee 100% backward compatibility.
+    """
+    # Reasonably small real number, preventing divide by zero errors.
+    FLOAT_NONCE = 1.0e-25
+
+    vBA += FLOAT_NONCE
+    zc += FLOAT_NONCE
+
+    alpha = (zc*vBA*p.F)/(p.R*T)
+
+    exp_alpha = np.exp(-alpha)
+
+    deno = -np.expm1(-alpha)   # calculate the denominator for the electrodiffusion equation,..
+
+    # calculate the flux for those elements:
+    flux = -((Dc*alpha)/d)*((cB -cA*exp_alpha)/deno)*rho
+
+    return flux
+
+
+def _electroflux_mps(cA, cB, Dc, d, zc, vBA, T, p, rho):
+    """Sovereign-Accelerated implementation for Apple Silicon (M-Series)."""
+    # Constants
+    FLOAT_NONCE = 1.0e-25
+    device = 'mps'
+    
+    # Bridge to Tensor (Optimized Casting)
+    cA_t = torch.as_tensor(cA, device=device, dtype=torch.float32)
+    cB_t = torch.as_tensor(cB, device=device, dtype=torch.float32)
+    vBA_t = torch.as_tensor(vBA, device=device, dtype=torch.float32)
+    Dc_t = torch.as_tensor(Dc, device=device, dtype=torch.float32)
+    d_t = torch.as_tensor(d, device=device, dtype=torch.float32)
+    
+    # Handle Scalars vs Arrays for broadcasting
+    zc_t = torch.as_tensor(zc, device=device, dtype=torch.float32) if isinstance(zc, np.ndarray) else zc
+    rho_t = torch.as_tensor(rho, device=device, dtype=torch.float32) if isinstance(rho, np.ndarray) else rho
+
+    # Physics Engine
     vBA_safe = vBA_t + FLOAT_NONCE
     zc_safe = zc_t + FLOAT_NONCE
-
-    # Calculate Alpha (Dimensionless Potential)
-    # F and R are scalars from 'p', safe to use directly
+    
     alpha = (zc_safe * vBA_safe * p.F) / (p.R * T)
-
-    # The Heavy Lift: Exponentials on Metal SFUs
+    
+    # Metal-Optimized Exponentials
     exp_alpha = torch.exp(-alpha)
-    deno = -torch.expm1(-alpha)  # precise exp(x)-1 calculation
+    deno = -torch.expm1(-alpha)
 
-    # Calculate Flux
-    # flux = -((Dc * alpha) / d) * ((cB - cA * exp_alpha) / deno) * rho
     flux = -((Dc_t * alpha) / d_t) * ((cB_t - cA_t * exp_alpha) / deno) * rho_t
-
-    # 4. RETURN
-    if return_numpy:
-        return flux.cpu().numpy()
-    else:
-        return flux
+    
+    return flux.cpu().numpy()
 
 def pumpNaKATP(cNai,cNao,cKi,cKo,Vm,T,p,block, met = None):
 
@@ -1392,6 +1408,3 @@ def rotate_field(gFxo, gFyo, angle):
     gFy = gFxo * np.sin(rotangle) + gFyo * np.cos(rotangle)
 
     return gFx, gFy
-
-
-
